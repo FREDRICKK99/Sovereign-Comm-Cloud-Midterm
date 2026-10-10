@@ -1,0 +1,7 @@
+"case","expected_http","observed_http","verdict","detail"
+"missing_jwt","401","401","PASS","mTLS present, Authorization absent"
+"missing_mtls","400","400","PASS","expected TLS/client-cert rejection"
+"malformed_jwt","401","401","PASS","syntactically invalid token"
+"tampered_signed_token","401","401","PASS","payload changed without resigning"
+"valid_auth_raw_export","403","403","PASS","OPA policy denial expected"
+"opa_unavailable_fail_closed","503","503","PASS","request not accepted"

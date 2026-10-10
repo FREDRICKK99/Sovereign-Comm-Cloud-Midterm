@@ -1,0 +1,4 @@
+block,profile,federation_size,target,token_ms,jwks_a_s,jwks_b_s,opa_s,tcp_connect_s,tls_appconnect_s,ttfb_s,total_s,http_code
+1,severe,4,site-b,140,0.017100,0.365279,0.001323,0.087147,0.212470,0.321000,0.321072,403
+1,severe,4,site-c,136,0.015092,0.365496,0.001312,0.094989,0.215421,0.342864,0.342937,403
+1,severe,4,site-d,152,0.015009,0.353616,0.001325,0.093263,0.216494,0.339773,0.339851,403

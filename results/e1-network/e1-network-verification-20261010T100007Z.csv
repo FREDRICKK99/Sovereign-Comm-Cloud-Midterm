@@ -1,0 +1,6 @@
+profile,configured_delay_ms,configured_jitter_ms,configured_loss_percent,configured_rate_mbit,measured_rtt_avg_ms,measured_loss_percent,measured_throughput_mbps
+baseline,0,0,0,0,0.801,0,4922.108730113438
+mild,25,5,0.5,50,26.463,0,15.89915741730338
+moderate,50,10,2,20,51.429,5,2.3980444361009314
+severe,100,20,5,5,102.296,0,0.5190952308581109
+extreme,250,50,10,1,247.242,15,0.3074174438032683

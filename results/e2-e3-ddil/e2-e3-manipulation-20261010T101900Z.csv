@@ -1,0 +1,10 @@
+federation_size,profile,target,probe,http_code,time_total_s,qdisc_packets
+3,severe,site-b,raw-export,403,0.297524,NA
+3,severe,site-c,raw-export,403,0.585469,NA
+4,severe,site-b,raw-export,403,0.335082,NA
+4,severe,site-c,raw-export,403,0.331541,NA
+4,severe,site-d,raw-export,403,0.307263,NA
+5,severe,site-b,raw-export,403,0.316678,NA
+5,severe,site-c,raw-export,403,0.326697,NA
+5,severe,site-d,raw-export,403,0.327162,NA
+5,severe,site-e,raw-export,403,0.894005,NA

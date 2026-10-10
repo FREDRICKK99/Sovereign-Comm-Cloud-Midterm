@@ -1,0 +1,1463 @@
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+
+use chrono::Utc;
+
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+
+use prometheus::{Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder};
+
+use reqwest::Client;
+
+use rusqlite::{Connection, params};
+
+use serde::{Deserialize, Serialize};
+
+use std::{
+    collections::HashMap,
+    env, fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use tokio::process::Command;
+
+use tracing::{error, info, warn};
+
+use uuid::Uuid;
+
+// ============================================================
+// APPLICATION STATE
+// ============================================================
+
+#[derive(Clone)]
+struct AppState {
+    site_id: String,
+    dataset_id: String,
+    pipeline_dir: String,
+
+    opa_url: String,
+
+    jwt_audience: String,
+
+    http_client: Client,
+
+    trusted_issuers: Vec<TrustedIssuer>,
+
+    jwt_keys: Arc<HashMap<String, JwtKey>>,
+
+    db: Arc<Mutex<Connection>>,
+
+    registry: Registry,
+
+    request_counter: IntCounterVec,
+    denied_counter: IntCounterVec,
+    opa_decision_counter: IntCounterVec,
+    jwt_counter: IntCounterVec,
+
+    job_duration: HistogramVec,
+}
+
+// ============================================================
+// API DATA STRUCTURES
+// ============================================================
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    site: String,
+    timestamp: String,
+}
+
+#[derive(Serialize)]
+struct Dataset {
+    dataset_id: String,
+    site: String,
+    data_type: String,
+    reference: String,
+
+    raw_data_local: bool,
+    raw_export_allowed: bool,
+    analysis_available: bool,
+}
+
+#[derive(Serialize)]
+struct DatasetResponse {
+    site: String,
+    datasets: Vec<Dataset>,
+}
+
+#[derive(Serialize)]
+struct CapabilitiesResponse {
+    site: String,
+    workflows: Vec<String>,
+    raw_data_export: bool,
+    authentication: String,
+    authorization: String,
+}
+
+#[derive(Deserialize)]
+struct JobRequest {
+    dataset_id: String,
+    workflow: String,
+}
+
+#[derive(Serialize)]
+struct JobSubmissionResponse {
+    job_id: String,
+    site: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct JobStatusResponse {
+    job_id: String,
+    site: String,
+
+    dataset_id: String,
+    workflow: String,
+
+    status: String,
+
+    created_at: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+
+    exit_code: Option<i32>,
+    log_path: Option<String>,
+}
+
+// ============================================================
+// OPA STRUCTURES
+// ============================================================
+
+#[derive(Serialize)]
+struct OpaInput {
+    authenticated: bool,
+
+    role: String,
+    action: String,
+
+    institution: String,
+
+    dataset_id: String,
+    workflow: String,
+
+    raw_export: bool,
+}
+
+#[derive(Serialize)]
+struct OpaRequest {
+    input: OpaInput,
+}
+
+#[derive(Deserialize)]
+struct OpaResponse {
+    result: Option<bool>,
+}
+
+// ============================================================
+// JWT STRUCTURES
+// ============================================================
+
+#[derive(Debug, Deserialize)]
+struct RealmAccess {
+    roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtClaims {
+    #[allow(dead_code)]
+    exp: usize,
+
+    #[allow(dead_code)]
+    iat: Option<usize>,
+
+    iss: String,
+    sub: String,
+
+    preferred_username: Option<String>,
+
+    realm_access: Option<RealmAccess>,
+}
+
+#[derive(Clone)]
+struct TrustedIssuer {
+    issuer: String,
+    institution: String,
+    jwks_url: String,
+}
+
+#[derive(Clone)]
+struct JwtKey {
+    key: DecodingKey,
+}
+
+#[derive(Clone)]
+struct AuthenticatedUser {
+    username: String,
+    institution: String,
+    role: String,
+}
+
+// ============================================================
+// LOAD PRIVATE FEDERATION CA
+// ============================================================
+
+fn load_ca_certificate(path: &str) -> anyhow::Result<reqwest::Certificate> {
+    let pem = fs::read(path)?;
+
+    let certificate = reqwest::Certificate::from_pem(&pem)?;
+
+    Ok(certificate)
+}
+
+// ============================================================
+// LOAD KEYCLOAK JWKS
+// ============================================================
+
+async fn load_jwt_keys(
+    client: &Client,
+    issuers: &[TrustedIssuer],
+) -> anyhow::Result<HashMap<String, JwtKey>> {
+    let mut keys = HashMap::new();
+
+    for trusted in issuers {
+        info!(
+            issuer = %trusted.issuer,
+            jwks_url = %trusted.jwks_url,
+            "Loading Keycloak JWKS"
+        );
+
+        let response = client
+            .get(&trusted.jwks_url)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let jwks: JwkSet = response.json().await?;
+
+        for jwk in jwks.keys {
+            let Some(kid) = jwk.common.key_id.clone() else {
+                warn!(
+                    issuer = %trusted.issuer,
+                    "Ignoring JWKS key without kid"
+                );
+
+                continue;
+            };
+
+            let decoding_key = match DecodingKey::from_jwk(&jwk) {
+                Ok(key) => key,
+
+                Err(err) => {
+                    warn!(
+                        issuer = %trusted.issuer,
+                        kid = %kid,
+                        error = %err,
+                        "Unable to use JWKS key"
+                    );
+
+                    continue;
+                }
+            };
+
+            let cache_key = format!("{}|{}", trusted.issuer, kid);
+
+            keys.insert(cache_key, JwtKey { key: decoding_key });
+        }
+    }
+
+    if keys.is_empty() {
+        anyhow::bail!("No usable Keycloak JWT verification keys were loaded");
+    }
+
+    info!(key_count = keys.len(), "Keycloak verification keys loaded");
+
+    Ok(keys)
+}
+
+// ============================================================
+// JWT AUTHENTICATION
+// ============================================================
+
+async fn authenticate_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedUser, Response> {
+    let authorization = match headers.get(header::AUTHORIZATION) {
+        Some(value) => value,
+
+        None => {
+            state.jwt_counter.with_label_values(&["missing"]).inc();
+
+            return Err((StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response());
+        }
+    };
+
+    let authorization = match authorization.to_str() {
+        Ok(value) => value,
+
+        Err(_) => {
+            state
+                .jwt_counter
+                .with_label_values(&["invalid_header"])
+                .inc();
+
+            return Err((StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response());
+        }
+    };
+
+    let Some(token) = authorization.strip_prefix("Bearer ") else {
+        state.jwt_counter.with_label_values(&["not_bearer"]).inc();
+
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Authorization must use Bearer token",
+        )
+            .into_response());
+    };
+
+    if token.trim().is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "Bearer token is empty").into_response());
+    }
+
+    let jwt_header = match decode_header(token) {
+        Ok(header) => header,
+
+        Err(err) => {
+            state.jwt_counter.with_label_values(&["invalid"]).inc();
+
+            warn!(
+                error = %err,
+                "JWT header decoding failed"
+            );
+
+            return Err((StatusCode::UNAUTHORIZED, "Invalid JWT").into_response());
+        }
+    };
+
+    if jwt_header.alg != Algorithm::RS256 {
+        state.jwt_counter.with_label_values(&["algorithm"]).inc();
+
+        warn!(
+            algorithm = ?jwt_header.alg,
+            "JWT rejected due to unsupported algorithm"
+        );
+
+        return Err((StatusCode::UNAUTHORIZED, "Unsupported JWT algorithm").into_response());
+    }
+
+    let Some(kid) = jwt_header.kid else {
+        state.jwt_counter.with_label_values(&["missing_kid"]).inc();
+
+        return Err((StatusCode::UNAUTHORIZED, "JWT missing kid").into_response());
+    };
+
+    for trusted in &state.trusted_issuers {
+        let cache_key = format!("{}|{}", trusted.issuer, kid);
+
+        let Some(jwt_key) = state.jwt_keys.get(&cache_key) else {
+            continue;
+        };
+
+        let mut validation = Validation::new(Algorithm::RS256);
+
+        validation.set_issuer(&[trusted.issuer.as_str()]);
+
+        validation.set_required_spec_claims(&["exp", "iss", "sub"]);
+
+        validation.validate_exp = true;
+
+        validation.set_audience(&[state.jwt_audience.as_str()]);
+
+        validation.validate_aud = true;
+
+        validation.leeway = 30;
+
+        let decoded = match decode::<JwtClaims>(token, &jwt_key.key, &validation) {
+            Ok(decoded) => decoded,
+
+            Err(_) => continue,
+        };
+
+        let claims = decoded.claims;
+
+        if claims.iss != trusted.issuer {
+            continue;
+        }
+
+        let username = claims
+            .preferred_username
+            .unwrap_or_else(|| claims.sub.clone());
+
+        let roles = claims
+            .realm_access
+            .map(|realm| realm.roles)
+            .unwrap_or_default();
+
+        let role = if roles
+            .iter()
+            .any(|candidate| candidate == "institution-admin")
+        {
+            "institution-admin"
+        } else if roles.iter().any(|candidate| candidate == "data-steward") {
+            "data-steward"
+        } else if roles.iter().any(|candidate| candidate == "researcher") {
+            "researcher"
+        } else {
+            state.jwt_counter.with_label_values(&["no_role"]).inc();
+
+            warn!(
+                username = %username,
+                issuer = %claims.iss,
+                "Authenticated user has no federation role"
+            );
+
+            return Err((StatusCode::FORBIDDEN, "No authorized federation role").into_response());
+        };
+
+        state.jwt_counter.with_label_values(&["valid"]).inc();
+
+        info!(
+            username = %username,
+            institution = %trusted.institution,
+            role = %role,
+            issuer = %trusted.issuer,
+            audience = %state.jwt_audience,
+            "JWT authentication successful"
+        );
+
+        return Ok(AuthenticatedUser {
+            username,
+
+            institution: trusted.institution.clone(),
+
+            role: role.to_string(),
+        });
+    }
+
+    state
+        .jwt_counter
+        .with_label_values(&["verification_failed"])
+        .inc();
+
+    warn!(
+        kid = %kid,
+        expected_audience = %state.jwt_audience,
+        "JWT verification failed"
+    );
+
+    Err((StatusCode::UNAUTHORIZED, "JWT verification failed").into_response())
+}
+
+// ============================================================
+// OPA AUTHORIZATION
+// ============================================================
+
+async fn opa_authorize(
+    state: &AppState,
+
+    authenticated: bool,
+
+    role: &str,
+
+    action: &str,
+
+    institution: &str,
+
+    dataset_id: &str,
+
+    workflow: &str,
+
+    raw_export: bool,
+) -> Result<bool, String> {
+    let payload = OpaRequest {
+        input: OpaInput {
+            authenticated,
+
+            role: role.to_string(),
+
+            action: action.to_string(),
+
+            institution: institution.to_string(),
+
+            dataset_id: dataset_id.to_string(),
+
+            workflow: workflow.to_string(),
+
+            raw_export,
+        },
+    };
+
+    let response = state
+        .http_client
+        .post(&state.opa_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("OPA request failed: {err}"))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(format!("OPA returned HTTP {}", status));
+    }
+
+    let decision: OpaResponse = response
+        .json()
+        .await
+        .map_err(|err| format!("Invalid OPA response: {err}"))?;
+
+    Ok(decision.result.unwrap_or(false))
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    state.request_counter.with_label_values(&["health"]).inc();
+
+    Json(HealthResponse {
+        status: "online".to_string(),
+
+        site: state.site_id,
+
+        timestamp: Utc::now().to_rfc3339(),
+    })
+}
+
+// ============================================================
+// DATASETS
+// ============================================================
+
+async fn datasets(State(state): State<AppState>) -> Json<DatasetResponse> {
+    state.request_counter.with_label_values(&["datasets"]).inc();
+
+    Json(DatasetResponse {
+        site: state.site_id.clone(),
+
+        datasets: vec![Dataset {
+            dataset_id: state.dataset_id,
+
+            site: state.site_id,
+
+            data_type: "FASTQ".to_string(),
+
+            reference: "test-reference".to_string(),
+
+            raw_data_local: true,
+
+            raw_export_allowed: false,
+
+            analysis_available: true,
+        }],
+    })
+}
+
+// ============================================================
+// CAPABILITIES
+// ============================================================
+
+async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
+    state
+        .request_counter
+        .with_label_values(&["capabilities"])
+        .inc();
+
+    Json(CapabilitiesResponse {
+        site: state.site_id,
+
+        workflows: vec!["fastqc".to_string(), "variant_call".to_string()],
+
+        raw_data_export: false,
+
+        authentication: format!(
+            "Keycloak JWT (aud={}) + inter-site mTLS",
+            state.jwt_audience
+        ),
+
+        authorization: "Open Policy Agent (OPA)".to_string(),
+    })
+}
+
+// ============================================================
+// RAW EXPORT
+// ============================================================
+
+async fn raw_export(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    state
+        .request_counter
+        .with_label_values(&["raw_export"])
+        .inc();
+
+    let authenticated_user = match authenticate_request(&state, &headers).await {
+        Ok(user) => user,
+
+        Err(response) => return response,
+    };
+
+    let allowed = match opa_authorize(
+        &state,
+        true,
+        &authenticated_user.role,
+        "raw_export",
+        &authenticated_user.institution,
+        &state.dataset_id,
+        "raw_export",
+        true,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+
+        Err(err) => {
+            state
+                .denied_counter
+                .with_label_values(&["opa_unavailable"])
+                .inc();
+
+            state
+                .opa_decision_counter
+                .with_label_values(&["error"])
+                .inc();
+
+            warn!(
+                site = %state.site_id,
+                username = %authenticated_user.username,
+                institution = %authenticated_user.institution,
+                action = "RAW_EXPORT",
+                decision = "DENY",
+                reason = "opa_unavailable",
+                error = %err,
+                "OPA authorization unavailable"
+            );
+
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authorization service unavailable",
+            )
+                .into_response();
+        }
+    };
+
+    if !allowed {
+        state
+            .denied_counter
+            .with_label_values(&["raw_export"])
+            .inc();
+
+        state
+            .opa_decision_counter
+            .with_label_values(&["deny"])
+            .inc();
+
+        warn!(
+            site = %state.site_id,
+            username = %authenticated_user.username,
+            institution = %authenticated_user.institution,
+            role = %authenticated_user.role,
+            action = "RAW_EXPORT",
+            dataset = %state.dataset_id,
+            decision = "DENY",
+            reason = "opa_policy",
+            "Raw genomic export denied"
+        );
+
+        return (
+            StatusCode::FORBIDDEN,
+            "Raw genomic export prohibited by federation policy",
+        )
+            .into_response();
+    }
+
+    state
+        .opa_decision_counter
+        .with_label_values(&["allow"])
+        .inc();
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Raw genomic export implementation is disabled",
+    )
+        .into_response()
+}
+
+// ============================================================
+// SUBMIT JOB
+// ============================================================
+
+async fn submit_job(
+    State(state): State<AppState>,
+
+    headers: HeaderMap,
+
+    Json(request): Json<JobRequest>,
+) -> Response {
+    state
+        .request_counter
+        .with_label_values(&["submit_job"])
+        .inc();
+
+    let authenticated_user = match authenticate_request(&state, &headers).await {
+        Ok(user) => user,
+
+        Err(response) => return response,
+    };
+
+    let requester = authenticated_user.username.clone();
+
+    let institution = authenticated_user.institution.clone();
+
+    let role = authenticated_user.role.clone();
+
+    if request.dataset_id != state.dataset_id {
+        state
+            .denied_counter
+            .with_label_values(&["unknown_dataset"])
+            .inc();
+
+        warn!(
+            site = %state.site_id,
+            requester = %requester,
+            institution = %institution,
+            dataset = %request.dataset_id,
+            decision = "DENY",
+            reason = "unknown_dataset",
+            "Federation job rejected"
+        );
+
+        return (StatusCode::FORBIDDEN, "Dataset not authorized at this site").into_response();
+    }
+
+    let opa_allowed = match opa_authorize(
+        &state,
+        true,
+        &role,
+        "submit_analysis",
+        &institution,
+        &request.dataset_id,
+        &request.workflow,
+        false,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+
+        Err(err) => {
+            state.denied_counter.with_label_values(&["opa_error"]).inc();
+
+            state
+                .opa_decision_counter
+                .with_label_values(&["error"])
+                .inc();
+
+            warn!(
+                site = %state.site_id,
+                requester = %requester,
+                institution = %institution,
+                role = %role,
+                dataset = %request.dataset_id,
+                workflow = %request.workflow,
+                decision = "DENY",
+                reason = "opa_unavailable",
+                error = %err,
+                "OPA authorization failed"
+            );
+
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authorization service unavailable",
+            )
+                .into_response();
+        }
+    };
+
+    if !opa_allowed {
+        state
+            .denied_counter
+            .with_label_values(&["opa_policy"])
+            .inc();
+
+        state
+            .opa_decision_counter
+            .with_label_values(&["deny"])
+            .inc();
+
+        warn!(
+            site = %state.site_id,
+            requester = %requester,
+            institution = %institution,
+            role = %role,
+            dataset = %request.dataset_id,
+            workflow = %request.workflow,
+            decision = "DENY",
+            reason = "opa_policy",
+            "OPA denied federation job"
+        );
+
+        return (StatusCode::FORBIDDEN, "OPA authorization denied").into_response();
+    }
+
+    state
+        .opa_decision_counter
+        .with_label_values(&["allow"])
+        .inc();
+
+    let job_id = Uuid::new_v4().to_string();
+
+    let created_at = Utc::now().to_rfc3339();
+
+    {
+        let db = match state.db.lock() {
+            Ok(db) => db,
+
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable").into_response();
+            }
+        };
+
+        if let Err(err) = db.execute(
+            "
+                INSERT INTO jobs (
+                    job_id,
+                    site,
+                    dataset_id,
+                    workflow,
+                    status,
+                    created_at
+                )
+                VALUES (
+                    ?1,
+                    ?2,
+                    ?3,
+                    ?4,
+                    'QUEUED',
+                    ?5
+                )
+                ",
+            params![
+                job_id,
+                state.site_id,
+                request.dataset_id,
+                request.workflow,
+                created_at,
+            ],
+        ) {
+            error!(
+                site = %state.site_id,
+                error = %err,
+                "Database insert failed"
+            );
+
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    }
+
+    info!(
+        job_id = %job_id,
+        site = %state.site_id,
+        requester = %requester,
+        institution = %institution,
+        role = %role,
+        dataset = %request.dataset_id,
+        workflow = %request.workflow,
+        authentication = "Keycloak-JWT",
+        authorization = "OPA",
+        decision = "ALLOW",
+        "Federated job accepted"
+    );
+
+    let background_state = state.clone();
+
+    let background_job_id = job_id.clone();
+
+    let background_dataset = request.dataset_id.clone();
+
+    let background_workflow = request.workflow.clone();
+
+    tokio::spawn(async move {
+        let started_at = Utc::now().to_rfc3339();
+
+        {
+            if let Ok(db) = background_state.db.lock() {
+                let _ = db.execute(
+                    "
+                            UPDATE jobs
+                            SET
+                                status = 'RUNNING',
+                                started_at = ?1
+                            WHERE
+                                job_id = ?2
+                            ",
+                    params![started_at, background_job_id,],
+                );
+            }
+        }
+
+        let timer = Instant::now();
+
+        let short_job_id = background_job_id.chars().take(8).collect::<String>();
+
+        let nextflow_name = format!("fed_{}", short_job_id);
+
+        let run_id = format!("{}-{}", background_state.site_id, nextflow_name);
+
+        let log_directory = PathBuf::from("/genomics/work/federation/logs");
+
+        if let Err(err) = fs::create_dir_all(&log_directory) {
+            error!(
+                job_id = %background_job_id,
+                error = %err,
+                "Unable to create federation log directory"
+            );
+        }
+
+        let log_path = log_directory.join(format!("{}.log", background_job_id));
+
+        // Resume is enabled by default for existing deployments.
+        // Set NEXTFLOW_RESUME=false for a controlled fresh-execution experiment.
+        let resume_enabled = env::var("NEXTFLOW_RESUME")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+
+        let mut command = Command::new("/usr/local/bin/nextflow");
+        command
+            .arg("run")
+            .arg("main.nf")
+            .arg("--run_id")
+            .arg(&run_id)
+            .arg("-name")
+            .arg(&nextflow_name);
+
+        if resume_enabled {
+            command.arg("-resume");
+        }
+
+        info!(
+            job_id = %background_job_id,
+            resume_enabled = resume_enabled,
+            "Launching Nextflow workflow"
+        );
+
+        let output = command
+            .current_dir(&background_state.pipeline_dir)
+            .output()
+            .await;
+
+        let duration_seconds = timer.elapsed().as_secs_f64();
+
+        background_state
+            .job_duration
+            .with_label_values(&[&background_workflow])
+            .observe(duration_seconds);
+
+        let completed_at = Utc::now().to_rfc3339();
+
+        match output {
+            Ok(output) => {
+                let mut log_data = Vec::new();
+
+                log_data.extend_from_slice(b"===== STDOUT =====\n");
+
+                log_data.extend_from_slice(&output.stdout);
+
+                log_data.extend_from_slice(b"\n===== STDERR =====\n");
+
+                log_data.extend_from_slice(&output.stderr);
+
+                if let Err(err) = fs::write(&log_path, log_data) {
+                    error!(
+                        job_id = %background_job_id,
+                        error = %err,
+                        "Unable to write workflow log"
+                    );
+                }
+
+                let exit_code = output.status.code().unwrap_or(-1);
+
+                let final_status = if output.status.success() {
+                    "COMPLETED"
+                } else {
+                    "FAILED"
+                };
+
+                {
+                    if let Ok(db) = background_state.db.lock() {
+                        let _ = db.execute(
+                            "
+                                    UPDATE jobs
+                                    SET
+                                        status = ?1,
+                                        completed_at = ?2,
+                                        exit_code = ?3,
+                                        log_path = ?4
+                                    WHERE
+                                        job_id = ?5
+                                    ",
+                            params![
+                                final_status,
+                                completed_at,
+                                exit_code,
+                                log_path.to_string_lossy().to_string(),
+                                background_job_id,
+                            ],
+                        );
+                    }
+                }
+
+                info!(
+                    job_id = %background_job_id,
+                    site = %background_state.site_id,
+                    dataset = %background_dataset,
+                    workflow = %background_workflow,
+                    status = %final_status,
+                    exit_code = exit_code,
+                    duration_seconds = duration_seconds,
+                    "Federated workflow finished"
+                );
+            }
+
+            Err(err) => {
+                let failure_message = format!("Failed to launch Nextflow workflow: {err}\n");
+
+                let _ = fs::write(&log_path, failure_message);
+
+                {
+                    if let Ok(db) = background_state.db.lock() {
+                        let _ = db.execute(
+                            "
+                                    UPDATE jobs
+                                    SET
+                                        status = 'FAILED',
+                                        completed_at = ?1,
+                                        exit_code = -1,
+                                        log_path = ?2
+                                    WHERE
+                                        job_id = ?3
+                                    ",
+                            params![
+                                completed_at,
+                                log_path.to_string_lossy().to_string(),
+                                background_job_id,
+                            ],
+                        );
+                    }
+                }
+
+                error!(
+                    job_id = %background_job_id,
+                    site = %background_state.site_id,
+                    dataset = %background_dataset,
+                    workflow = %background_workflow,
+                    error = %err,
+                    "Federated workflow launch failed"
+                );
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(JobSubmissionResponse {
+            job_id,
+
+            site: state.site_id,
+
+            status: "QUEUED".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+// ============================================================
+// JOB STATUS
+// ============================================================
+
+async fn job_status(Path(job_id): Path<String>, State(state): State<AppState>) -> Response {
+    state
+        .request_counter
+        .with_label_values(&["job_status"])
+        .inc();
+
+    let db = match state.db.lock() {
+        Ok(db) => db,
+
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable").into_response();
+        }
+    };
+
+    let mut statement = match db.prepare(
+        "
+            SELECT
+                job_id,
+                site,
+                dataset_id,
+                workflow,
+                status,
+                created_at,
+                started_at,
+                completed_at,
+                exit_code,
+                log_path
+            FROM jobs
+            WHERE job_id = ?1
+            ",
+    ) {
+        Ok(statement) => statement,
+
+        Err(err) => {
+            error!(
+                error = %err,
+                "Could not prepare job-status query"
+            );
+
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    let result = statement.query_row(params![job_id], |row| {
+        Ok(JobStatusResponse {
+            job_id: row.get(0)?,
+
+            site: row.get(1)?,
+
+            dataset_id: row.get(2)?,
+
+            workflow: row.get(3)?,
+
+            status: row.get(4)?,
+
+            created_at: row.get(5)?,
+
+            started_at: row.get(6)?,
+
+            completed_at: row.get(7)?,
+
+            exit_code: row.get(8)?,
+
+            log_path: row.get(9)?,
+        })
+    });
+
+    match result {
+        Ok(job) => Json(job).into_response(),
+
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            (StatusCode::NOT_FOUND, "Job not found").into_response()
+        }
+
+        Err(err) => {
+            error!(
+                error = %err,
+                "Job-status query failed"
+            );
+
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
+// ============================================================
+// PROMETHEUS METRICS
+// ============================================================
+
+async fn metrics(State(state): State<AppState>) -> Response {
+    let encoder = TextEncoder::new();
+
+    let metric_families = state.registry.gather();
+
+    let mut buffer = Vec::new();
+
+    if let Err(err) = encoder.encode(&metric_families, &mut buffer) {
+        error!(
+            error = %err,
+            "Could not encode Prometheus metrics"
+        );
+
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Metric encoding error").into_response();
+    }
+
+    (
+        [(header::CONTENT_TYPE, encoder.format_type().to_string())],
+        buffer,
+    )
+        .into_response()
+}
+
+// ============================================================
+// DATABASE
+// ============================================================
+
+fn initialize_database(database_path: &str) -> anyhow::Result<Connection> {
+    if let Some(parent) = PathBuf::from(database_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let connection = Connection::open(database_path)?;
+
+    connection.execute(
+        "
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            site TEXT NOT NULL,
+            dataset_id TEXT NOT NULL,
+            workflow TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            exit_code INTEGER,
+            log_path TEXT
+        )
+        ",
+        [],
+    )?;
+
+    let columns: Vec<String> = {
+        let mut statement = connection.prepare("PRAGMA table_info(jobs)")?;
+
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+
+        rows.filter_map(Result::ok).collect()
+    };
+
+    if !columns.iter().any(|column| column == "started_at") {
+        connection.execute(
+            "
+            ALTER TABLE jobs
+            ADD COLUMN started_at TEXT
+            ",
+            [],
+        )?;
+    }
+
+    if !columns.iter().any(|column| column == "log_path") {
+        connection.execute(
+            "
+            ALTER TABLE jobs
+            ADD COLUMN log_path TEXT
+            ",
+            [],
+        )?;
+    }
+
+    Ok(connection)
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_target(false).json().init();
+
+    // ========================================================
+    // GENERAL CONFIG
+    // ========================================================
+
+    let site_id = env::var("SITE_ID").unwrap_or_else(|_| "site-a".to_string());
+
+    let dataset_id = env::var("DATASET_ID").unwrap_or_else(|_| "dataset-001".to_string());
+
+    let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+
+    let pipeline_dir =
+        env::var("PIPELINE_DIR").unwrap_or_else(|_| "/genomics/work/nextflow-site-a".to_string());
+
+    let database_path = env::var("DATABASE_PATH")
+        .unwrap_or_else(|_| "/genomics/work/federation/jobs.db".to_string());
+
+    let opa_url = env::var("OPA_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8181/v1/data/genomics/authz/allow".to_string());
+
+    // ========================================================
+    // JWT / KEYCLOAK CONFIG
+    // ========================================================
+
+    let site_a_issuer = env::var("SITE_A_ISSUER")
+        .unwrap_or_else(|_| "https://10.10.10.10:9443/realms/genomics".to_string());
+
+    let site_b_issuer = env::var("SITE_B_ISSUER")
+        .unwrap_or_else(|_| "https://10.20.20.10:9443/realms/genomics".to_string());
+
+    let keycloak_ca_path = env::var("KEYCLOAK_CA_PATH")
+        .unwrap_or_else(|_| "/etc/federation-tls/ca/ca.crt".to_string());
+
+    let jwt_audience = env::var("JWT_AUDIENCE").unwrap_or_else(|_| "federation-api".to_string());
+
+    let trusted_issuers = vec![
+        TrustedIssuer {
+            issuer: site_a_issuer.clone(),
+
+            institution: "site-a".to_string(),
+
+            jwks_url: format!("{}/protocol/openid-connect/certs", site_a_issuer),
+        },
+        TrustedIssuer {
+            issuer: site_b_issuer.clone(),
+
+            institution: "site-b".to_string(),
+
+            jwks_url: format!("{}/protocol/openid-connect/certs", site_b_issuer),
+        },
+    ];
+
+    // ========================================================
+    // DATABASE
+    // ========================================================
+
+    let connection = initialize_database(&database_path)?;
+
+    // ========================================================
+    // HTTP CLIENT
+    // ========================================================
+
+    let federation_ca = load_ca_certificate(&keycloak_ca_path)?;
+
+    let http_client = Client::builder()
+        .add_root_certificate(federation_ca)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    // ========================================================
+    // JWT KEYS
+    // ========================================================
+
+    let jwt_keys = load_jwt_keys(&http_client, &trusted_issuers).await?;
+
+    let jwt_key_count = jwt_keys.len();
+
+    // ========================================================
+    // PROMETHEUS
+    // ========================================================
+
+    let registry = Registry::new();
+
+    let request_counter = IntCounterVec::new(
+        prometheus::Opts::new("federation_requests_total", "Total federation API requests"),
+        &["endpoint"],
+    )?;
+
+    let denied_counter = IntCounterVec::new(
+        prometheus::Opts::new(
+            "federation_denied_total",
+            "Total federation requests denied",
+        ),
+        &["reason"],
+    )?;
+
+    let opa_decision_counter = IntCounterVec::new(
+        prometheus::Opts::new(
+            "federation_opa_decisions_total",
+            "OPA authorization decisions",
+        ),
+        &["decision"],
+    )?;
+
+    let jwt_counter = IntCounterVec::new(
+        prometheus::Opts::new("federation_jwt_validation_total", "JWT validation outcomes"),
+        &["result"],
+    )?;
+
+    let job_duration = HistogramVec::new(
+        HistogramOpts::new(
+            "federation_job_duration_seconds",
+            "Federated genomic workflow duration",
+        ),
+        &["workflow"],
+    )?;
+
+    registry.register(Box::new(request_counter.clone()))?;
+
+    registry.register(Box::new(denied_counter.clone()))?;
+
+    registry.register(Box::new(opa_decision_counter.clone()))?;
+
+    registry.register(Box::new(jwt_counter.clone()))?;
+
+    registry.register(Box::new(job_duration.clone()))?;
+
+    // ========================================================
+    // APPLICATION STATE
+    // ========================================================
+
+    let state = AppState {
+        site_id: site_id.clone(),
+
+        dataset_id,
+
+        pipeline_dir,
+
+        opa_url: opa_url.clone(),
+
+        jwt_audience: jwt_audience.clone(),
+
+        http_client,
+
+        trusted_issuers,
+
+        jwt_keys: Arc::new(jwt_keys),
+
+        db: Arc::new(Mutex::new(connection)),
+
+        registry,
+
+        request_counter,
+
+        denied_counter,
+
+        opa_decision_counter,
+
+        jwt_counter,
+
+        job_duration,
+    };
+
+    // ========================================================
+    // ROUTES
+    // ========================================================
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/datasets", get(datasets))
+        .route("/capabilities", get(capabilities))
+        .route("/jobs", post(submit_job))
+        .route("/jobs/{job_id}", get(job_status))
+        .route("/raw-export", post(raw_export))
+        .route("/metrics", get(metrics))
+        .with_state(state);
+
+    // ========================================================
+    // LISTENER
+    // ========================================================
+
+    let socket_address: SocketAddr = listen_addr.parse()?;
+
+    info!(
+        site = %site_id,
+        address = %socket_address,
+        opa_url = %opa_url,
+        site_a_issuer = %site_a_issuer,
+        site_b_issuer = %site_b_issuer,
+        jwt_audience = %jwt_audience,
+        jwt_key_count = jwt_key_count,
+        "Federation agent starting"
+    );
+
+    let listener = tokio::net::TcpListener::bind(socket_address).await?;
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}

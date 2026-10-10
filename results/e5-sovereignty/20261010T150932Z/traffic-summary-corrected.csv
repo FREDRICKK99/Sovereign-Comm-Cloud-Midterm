@@ -1,0 +1,7 @@
+node,interface,packets,ipv4_bytes,ipv6_bytes
+b-core,eth0,559,154492,0
+b-core,eth1,832,2450277,0
+b-storage,eth0,221,59240,0
+b-storage,eth1,811,2438454,0
+b-worker,eth0,223,59262,0
+b-worker,eth1,3,402,0

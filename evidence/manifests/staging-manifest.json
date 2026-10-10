@@ -1,0 +1,167 @@
+[
+  {
+    "path": ".gitignore",
+    "bytes": 478,
+    "review": "required before publishing"
+  },
+  {
+    "path": "README.md",
+    "bytes": 5298,
+    "review": "required before publishing"
+  },
+  {
+    "path": "architecture/README.md",
+    "bytes": 643,
+    "review": "required before publishing"
+  },
+  {
+    "path": "architecture/diagrams/Sovereign_Genomics_Architectures.drawio",
+    "bytes": 24563,
+    "review": "required before publishing"
+  },
+  {
+    "path": "architecture/diagrams/Sovereign_Genomics_Architectures_BW.drawio",
+    "bytes": 38706,
+    "review": "required before publishing"
+  },
+  {
+    "path": "architecture/diagrams/Sovereign_Genomics_Architectures_BW_Updated.drawio",
+    "bytes": 39232,
+    "review": "required before publishing"
+  },
+  {
+    "path": "architecture/slides/Complete_Sovereign_Genomics_Cloud_Architectures.pptx",
+    "bytes": 1275388,
+    "review": "required before publishing"
+  },
+  {
+    "path": "config/examples/site.env.example",
+    "bytes": 200,
+    "review": "required before publishing"
+  },
+  {
+    "path": "docs/guides/Proxmox_Federated_Genomics_Implementation_Guide.docx",
+    "bytes": 333648,
+    "review": "required before publishing"
+  },
+  {
+    "path": "docs/guides/Proxmox_Federated_Genomics_Implementation_Guide.pdf",
+    "bytes": 595750,
+    "review": "required before publishing"
+  },
+  {
+    "path": "docs/presentations/Federated_Sovereign_Genomics_Cloud_3_4_5_Site_Results.pptx",
+    "bytes": 781348,
+    "review": "required before publishing"
+  },
+  {
+    "path": "docs/presentations/Federated_Sovereign_Genomics_Cloud_Updated_Scale_Results.pptx",
+    "bytes": 690151,
+    "review": "required before publishing"
+  },
+  {
+    "path": "docs/reproducibility.md",
+    "bytes": 1813,
+    "review": "required before publishing"
+  },
+  {
+    "path": "docs/research/Federated_Genomics_Cloud_Midterm_Hypothesis.pdf",
+    "bytes": 8572,
+    "review": "required before publishing"
+  },
+  {
+    "path": "evidence/README.md",
+    "bytes": 525,
+    "review": "required before publishing"
+  },
+  {
+    "path": "results/README.md",
+    "bytes": 780,
+    "review": "required before publishing"
+  },
+  {
+    "path": "results/scale/federation_scale_aggregate_summary.csv",
+    "bytes": 933,
+    "review": "required before publishing"
+  },
+  {
+    "path": "results/scale/federation_scale_endpoint_summary.csv",
+    "bytes": 3292,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/audit/run-e5-egress-audit-fixed.sh",
+    "bytes": 8946,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/audit/run-e5-egress-audit-fresh.sh",
+    "bytes": 11707,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/experiments/run-all-final-genomics-corrected.sh",
+    "bytes": 42525,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/experiments/run-all-final-genomics-ddil-multisite.sh",
+    "bytes": 45649,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/experiments/run-all-final-genomics-experiments.sh",
+    "bytes": 41493,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/experiments/run-all-final-genomics-fixed-e2e3.sh",
+    "bytes": 47395,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/provisioning/federation-scale-lab-ceph-aptlock-fixed.sh",
+    "bytes": 28976,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/provisioning/federation-scale-lab-ceph-final.sh",
+    "bytes": 29405,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/provisioning/federation-scale-lab-ceph-routes-final.sh",
+    "bytes": 32289,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/provisioning/federation-scale-lab-ceph.sh",
+    "bytes": 25890,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/provisioning/federation-scale-lab-final.sh",
+    "bytes": 36028,
+    "review": "required before publishing"
+  },
+  {
+    "path": "scripts/provisioning/federation-scale-lab-updated.sh",
+    "bytes": 34197,
+    "review": "required before publishing"
+  },
+  {
+    "path": "src/federation-agent/main.rs.review-required",
+    "bytes": 38656,
+    "review": "required before publishing"
+  },
+  {
+    "path": "tools/collect-lab-artifacts.sh",
+    "bytes": 2285,
+    "review": "required before publishing"
+  },
+  {
+    "path": "tools/prepublish-check.sh",
+    "bytes": 720,
+    "review": "required before publishing"
+  }
+]
